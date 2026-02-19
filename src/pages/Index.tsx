@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { useSeoMeta } from '@unhead/react';
 import { useCurrentUser } from '@/hooks/useCurrentUser';
 import { useTheme } from '@/hooks/useTheme';
+import { useWatchChallengeAcceptance } from '@/hooks/useChessChallenge';
 import { LoginArea } from '@/components/auth/LoginArea';
 import { ChallengeDialog } from '@/components/chess/ChallengeDialog';
 import { ChallengeList } from '@/components/chess/ChallengeList';
@@ -15,6 +16,9 @@ const Index = () => {
   const { user } = useCurrentUser();
   const { theme, setTheme } = useTheme();
   const [currentTime, setCurrentTime] = useState(new Date());
+
+  // Watch for challenge acceptance and auto-navigate to game
+  useWatchChallengeAcceptance();
 
   useSeoMeta({
     title: 'Nostr Chess - Play Chess Over Nostr',

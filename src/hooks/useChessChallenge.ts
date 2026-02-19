@@ -1,5 +1,7 @@
 import { useNostr } from '@nostrify/react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { useCurrentUser } from './useCurrentUser';
 import { type TimeControl, formatTimeControl } from '@/lib/chess';
 import { CHESS_CHALLENGE_KIND, generateGameId } from '@/lib/gameTypes';
@@ -205,11 +207,11 @@ export function usePendingChallenges() {
       return challenges.sort((a, b) => b.createdAt - a.createdAt);
     },
     enabled: !!user,
-    refetchInterval: 10000, // Refetch every 10 seconds
+    refetchInterval: 5000, // Refetch every 5 seconds
   });
 }
 
-// Hook for fetching outgoing challenges
+// Hook for fetching outgoing challenges and watching for acceptance
 export function useOutgoingChallenges() {
   const { nostr } = useNostr();
   const { user } = useCurrentUser();
@@ -217,8 +219,9 @@ export function useOutgoingChallenges() {
   return useQuery({
     queryKey: ['chess-challenges', 'outgoing', user?.pubkey],
     queryFn: async () => {
-      if (!user) return [];
+      if (!user) return { pending: [] as Challenge[], accepted: [] as { gameId: string; acceptedAt: number }[] };
 
+      // Query for both pending and accepted challenges
       const events = await nostr.query([
         {
           kinds: [CHESS_CHALLENGE_KIND],
@@ -226,22 +229,56 @@ export function useOutgoingChallenges() {
           '#status': ['pending'],
           limit: 50,
         },
+        {
+          kinds: [CHESS_CHALLENGE_KIND],
+          '#p': [user.pubkey],
+          '#status': ['accepted'],
+          limit: 50,
+        },
       ]);
 
-      const challenges: Challenge[] = [];
+      const pending: Challenge[] = [];
+      const accepted: { gameId: string; acceptedAt: number }[] = [];
       const seenIds = new Set<string>();
 
       for (const event of events) {
-        const challenge = parseChallenge(event);
-        if (challenge && !seenIds.has(challenge.id)) {
-          seenIds.add(challenge.id);
-          challenges.push(challenge);
+        const statusTag = event.tags.find(t => t[0] === 'status')?.[1];
+        const dTag = event.tags.find(t => t[0] === 'd')?.[1];
+        
+        if (!dTag) continue;
+
+        if (statusTag === 'accepted') {
+          // This is an acceptance event from the challenged player
+          accepted.push({ gameId: dTag, acceptedAt: event.created_at });
+        } else if (statusTag === 'pending' && event.pubkey === user.pubkey) {
+          const challenge = parseChallenge(event);
+          if (challenge && !seenIds.has(challenge.id)) {
+            seenIds.add(challenge.id);
+            pending.push(challenge);
+          }
         }
       }
 
-      return challenges.sort((a, b) => b.createdAt - a.createdAt);
+      return {
+        pending: pending.sort((a, b) => b.createdAt - a.createdAt),
+        accepted: accepted.sort((a, b) => b.acceptedAt - a.acceptedAt),
+      };
     },
     enabled: !!user,
-    refetchInterval: 10000,
+    refetchInterval: 3000, // Check more frequently for acceptances
   });
+}
+
+// Hook to watch for challenge acceptance and auto-navigate to game
+export function useWatchChallengeAcceptance() {
+  const { data } = useOutgoingChallenges();
+  const navigate = useNavigate();
+
+  useEffect(() => {
+    if (data?.accepted && data.accepted.length > 0) {
+      // Navigate to the most recently accepted game
+      const mostRecent = data.accepted[0];
+      navigate(`/game/${mostRecent.gameId}`);
+    }
+  }, [data?.accepted, navigate]);
 }

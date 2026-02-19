@@ -120,7 +120,8 @@ function ChallengeCard({ challenge, type }: ChallengeCardProps) {
       )}
 
       {type === 'outgoing' && (
-        <Badge variant="secondary" className="text-xs">
+        <Badge variant="secondary" className="text-xs animate-pulse">
+          <Loader2 className="h-3 w-3 mr-1 animate-spin" />
           Waiting...
         </Badge>
       )}
@@ -130,10 +131,11 @@ function ChallengeCard({ challenge, type }: ChallengeCardProps) {
 
 export function ChallengeList() {
   const { data: incomingChallenges, isLoading: loadingIncoming } = usePendingChallenges();
-  const { data: outgoingChallenges, isLoading: loadingOutgoing } = useOutgoingChallenges();
+  const { data: outgoingData, isLoading: loadingOutgoing } = useOutgoingChallenges();
 
+  const outgoingChallenges = outgoingData?.pending || [];
   const hasIncoming = incomingChallenges && incomingChallenges.length > 0;
-  const hasOutgoing = outgoingChallenges && outgoingChallenges.length > 0;
+  const hasOutgoing = outgoingChallenges.length > 0;
 
   if (loadingIncoming || loadingOutgoing) {
     return (
@@ -156,11 +158,14 @@ export function ChallengeList() {
   return (
     <div className="space-y-4">
       {hasIncoming && (
-        <Card>
+        <Card className="border-emerald-500/30 bg-emerald-500/5">
           <CardHeader className="pb-3">
             <CardTitle className="text-base flex items-center gap-2">
-              <Inbox className="h-4 w-4" />
+              <Inbox className="h-4 w-4 text-emerald-500" />
               Incoming Challenges
+              <Badge variant="secondary" className="ml-auto bg-emerald-500/20 text-emerald-600 dark:text-emerald-400">
+                {incomingChallenges.length}
+              </Badge>
             </CardTitle>
           </CardHeader>
           <CardContent className="space-y-2">

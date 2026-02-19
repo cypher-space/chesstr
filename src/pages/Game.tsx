@@ -1,14 +1,15 @@
-import { useState, useCallback, useEffect, useMemo } from 'react';
+import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useSeoMeta } from '@unhead/react';
+import { Chess } from 'chess.js';
 import { ChessBoard } from '@/components/chess/ChessBoard';
 import { ChessClock } from '@/components/chess/ChessClock';
-import { useChessGame } from '@/hooks/useChessGame';
 import { useChessGameData, usePublishMove, useGameSubscription } from '@/hooks/useNostrChessGame';
 import { useCurrentUser } from '@/hooks/useCurrentUser';
 import { useAuthor } from '@/hooks/useAuthor';
 import { genUserName } from '@/lib/genUserName';
-import { getResultText, type Square, type Color } from '@/lib/chess';
+import { getResultText, formatTimeControl, type Square, type Color, type TimeControl, type GameResult, parsePGNHeaders, generatePGN } from '@/lib/chess';
+import { formatTimeControlHeader } from '@/lib/gameTypes';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
@@ -16,7 +17,7 @@ import { Badge } from '@/components/ui/badge';
 import { Skeleton } from '@/components/ui/skeleton';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { useToast } from '@/hooks/useToast';
-import { ArrowLeft, Flag, Handshake, RotateCcw, Share2, Loader2 } from 'lucide-react';
+import { ArrowLeft, Flag, Clock, Loader2, RefreshCw } from 'lucide-react';
 import { LoginArea } from '@/components/auth/LoginArea';
 
 function PlayerInfo({ 
@@ -70,95 +71,257 @@ export default function Game() {
   const { toast } = useToast();
   const { user } = useCurrentUser();
   
-  const { data: gameData, isLoading: loadingGame } = useChessGameData(gameId);
+  const { data: gameData, isLoading: loadingGame, refetch } = useChessGameData(gameId);
   const { mutate: publishMove, isPending: isPublishing } = usePublishMove();
+
+  // Chess instance - recreated when gameData changes
+  const [chess] = useState(() => new Chess());
+  const [, forceUpdate] = useState(0);
+  const [lastMove, setLastMove] = useState<{ from: Square; to: Square } | null>(null);
+  const [result, setResult] = useState<GameResult>('*');
+  const lastLoadedPgnRef = useRef<string>('');
 
   useSeoMeta({
     title: 'Chess Game | Nostr Chess',
     description: 'Play chess over Nostr - cryptographically signed moves',
   });
 
-  // Initialize game state
-  const game = useChessGame({
-    initialPgn: gameData?.pgn,
-    white: gameData?.white,
-    black: gameData?.black,
-    timeControl: gameData?.timeControl || { initial: 300, increment: 0 },
-    currentUserPubkey: user?.pubkey,
-    onGameEnd: (result) => {
-      toast({
-        title: 'Game Over',
-        description: getResultText(result),
-      });
-    },
-  });
+  // Load PGN from game data
+  useEffect(() => {
+    if (!gameData?.pgn) return;
+    
+    // Only reload if PGN has changed
+    if (gameData.pgn === lastLoadedPgnRef.current) return;
+    
+    try {
+      // Handle empty or star-only PGN
+      if (gameData.pgn === '*' || gameData.pgn.trim() === '') {
+        chess.reset();
+        setLastMove(null);
+        setResult('*');
+      } else {
+        chess.loadPgn(gameData.pgn);
+        
+        // Set last move
+        const history = chess.history({ verbose: true });
+        if (history.length > 0) {
+          const lastMoveData = history[history.length - 1];
+          setLastMove({ from: lastMoveData.from, to: lastMoveData.to });
+        }
+        
+        // Check result from PGN headers
+        const headers = parsePGNHeaders(gameData.pgn);
+        if (headers.result && ['1-0', '0-1', '1/2-1/2'].includes(headers.result)) {
+          setResult(headers.result as GameResult);
+        } else if (chess.isCheckmate()) {
+          setResult(chess.turn() === 'w' ? '0-1' : '1-0');
+        } else if (chess.isDraw() || chess.isStalemate()) {
+          setResult('1/2-1/2');
+        } else {
+          setResult('*');
+        }
+      }
+      
+      lastLoadedPgnRef.current = gameData.pgn;
+      forceUpdate(n => n + 1);
+    } catch (err) {
+      console.error('Failed to load PGN:', err);
+    }
+  }, [gameData?.pgn, chess]);
 
   // Subscribe to game updates
   const handleGameUpdate = useCallback((pgn: string) => {
-    if (pgn !== game.pgn) {
-      game.loadPgn(pgn);
+    if (pgn === lastLoadedPgnRef.current) return;
+    
+    try {
+      if (pgn === '*' || pgn.trim() === '') {
+        chess.reset();
+        setLastMove(null);
+      } else {
+        chess.loadPgn(pgn);
+        const history = chess.history({ verbose: true });
+        if (history.length > 0) {
+          const lastMoveData = history[history.length - 1];
+          setLastMove({ from: lastMoveData.from, to: lastMoveData.to });
+        }
+        
+        // Check game end
+        if (chess.isCheckmate()) {
+          setResult(chess.turn() === 'w' ? '0-1' : '1-0');
+        } else if (chess.isDraw() || chess.isStalemate()) {
+          setResult('1/2-1/2');
+        }
+      }
+      
+      lastLoadedPgnRef.current = pgn;
+      forceUpdate(n => n + 1);
+    } catch {
+      console.error('Failed to parse game update');
     }
-  }, [game]);
+  }, [chess]);
 
   useGameSubscription(gameId, handleGameUpdate);
 
-  // Sync with gameData when it changes
-  useEffect(() => {
-    if (gameData?.pgn && gameData.pgn !== '*' && gameData.pgn !== game.pgn) {
-      game.loadPgn(gameData.pgn);
-    }
-  }, [gameData?.pgn]);
+  // Determine player color
+  const playerColor = useMemo((): Color | null => {
+    if (!user?.pubkey || !gameData) return null;
+    if (user.pubkey === gameData.white) return 'w';
+    if (user.pubkey === gameData.black) return 'b';
+    return null;
+  }, [user?.pubkey, gameData]);
+
+  // Board orientation
+  const orientation = playerColor === 'b' ? 'b' : 'w';
+
+  // Is it my turn?
+  const isMyTurn = playerColor ? chess.turn() === playerColor : false;
+
+  // Current turn
+  const turn = chess.turn();
+
+  // Move history
+  const moveHistory = useMemo(() => chess.history({ verbose: true }), [chess, forceUpdate]);
+
+  // Is game over?
+  const isGameOver = result !== '*';
 
   // Handle making a move
   const handleMove = useCallback((from: Square, to: Square, promotion?: string): boolean => {
-    if (!game.isMyTurn || isPublishing) return false;
+    if (!isMyTurn || isPublishing || isGameOver) return false;
     
-    // Make the move locally first
-    const success = game.makeMove(from, to, promotion);
-    
-    if (success && gameData && gameId) {
-      // Publish the move to Nostr
-      // We need to get the updated PGN after the move
-      setTimeout(() => {
-        publishMove({
-          gameId,
-          pgn: game.pgn,
-          white: gameData.white,
-          black: gameData.black,
-          timeControl: gameData.timeControl,
-          result: game.result,
-        }, {
-          onError: (error) => {
+    try {
+      const move = chess.move({ from, to, promotion });
+      if (!move) return false;
+      
+      setLastMove({ from, to });
+      
+      // Check game end
+      let newResult: GameResult = '*';
+      if (chess.isCheckmate()) {
+        newResult = chess.turn() === 'w' ? '0-1' : '1-0';
+      } else if (chess.isDraw() || chess.isStalemate()) {
+        newResult = '1/2-1/2';
+      }
+      if (newResult !== '*') {
+        setResult(newResult);
+      }
+
+      // Generate PGN with proper headers
+      const pgn = generatePGN(chess, {
+        event: 'Nostr Chess Game',
+        site: 'nostr',
+        date: new Date().toISOString().split('T')[0].replace(/-/g, '.'),
+        round: '?',
+        white: gameData!.white,
+        black: gameData!.black,
+        result: newResult,
+        timeControl: formatTimeControlHeader(gameData!.timeControl),
+      });
+
+      lastLoadedPgnRef.current = pgn;
+      forceUpdate(n => n + 1);
+
+      // Publish to Nostr
+      publishMove({
+        gameId: gameId!,
+        pgn,
+        white: gameData!.white,
+        black: gameData!.black,
+        timeControl: gameData!.timeControl,
+        result: newResult,
+      }, {
+        onSuccess: () => {
+          if (newResult !== '*') {
             toast({
-              title: 'Failed to publish move',
-              description: error.message,
-              variant: 'destructive',
+              title: 'Game Over',
+              description: getResultText(newResult),
             });
-          },
-        });
-      }, 0);
+          }
+        },
+        onError: (error) => {
+          toast({
+            title: 'Failed to publish move',
+            description: error.message,
+            variant: 'destructive',
+          });
+        },
+      });
+      
+      return true;
+    } catch {
+      return false;
     }
-    
-    return success;
-  }, [game, gameData, gameId, isPublishing, publishMove, toast]);
+  }, [chess, isMyTurn, isPublishing, isGameOver, gameData, gameId, publishMove, toast]);
 
   const handleResign = useCallback(() => {
-    if (!game.isMyTurn && game.result === '*') {
-      // Can resign even if not your turn
-    }
-    game.resign();
+    if (!playerColor || isGameOver) return;
     
-    if (gameData && gameId) {
+    const newResult: GameResult = playerColor === 'w' ? '0-1' : '1-0';
+    setResult(newResult);
+    
+    const pgn = generatePGN(chess, {
+      event: 'Nostr Chess Game',
+      site: 'nostr',
+      date: new Date().toISOString().split('T')[0].replace(/-/g, '.'),
+      round: '?',
+      white: gameData!.white,
+      black: gameData!.black,
+      result: newResult,
+      timeControl: formatTimeControlHeader(gameData!.timeControl),
+    });
+
+    publishMove({
+      gameId: gameId!,
+      pgn,
+      white: gameData!.white,
+      black: gameData!.black,
+      timeControl: gameData!.timeControl,
+      result: newResult,
+    }, {
+      onSuccess: () => {
+        toast({
+          title: 'You resigned',
+          description: getResultText(newResult),
+        });
+      },
+    });
+  }, [chess, playerColor, isGameOver, gameData, gameId, publishMove, toast]);
+
+  // Handle timeout - only for timed games
+  const handleTimeout = useCallback((color: Color) => {
+    if (isGameOver || gameData?.timeControl.initial === 0) return;
+    
+    const newResult: GameResult = color === 'w' ? '0-1' : '1-0';
+    setResult(newResult);
+    
+    // Only the player whose turn it is can report timeout
+    if (playerColor && playerColor !== color) {
+      const pgn = generatePGN(chess, {
+        event: 'Nostr Chess Game',
+        site: 'nostr',
+        date: new Date().toISOString().split('T')[0].replace(/-/g, '.'),
+        round: '?',
+        white: gameData!.white,
+        black: gameData!.black,
+        result: newResult,
+        timeControl: formatTimeControlHeader(gameData!.timeControl),
+      });
+
       publishMove({
-        gameId,
-        pgn: game.pgn,
-        white: gameData.white,
-        black: gameData.black,
-        timeControl: gameData.timeControl,
-        result: game.result,
+        gameId: gameId!,
+        pgn,
+        white: gameData!.white,
+        black: gameData!.black,
+        timeControl: gameData!.timeControl,
+        result: newResult,
       });
     }
-  }, [game, gameData, gameId, publishMove]);
+
+    toast({
+      title: 'Time out!',
+      description: getResultText(newResult),
+    });
+  }, [chess, isGameOver, playerColor, gameData, gameId, publishMove, toast]);
 
   if (loadingGame) {
     return (
@@ -187,8 +350,9 @@ export default function Game() {
     );
   }
 
-  const canPlay = user && game.playerColor && game.result === '*';
-  const isSpectator = !game.playerColor;
+  const canPlay = user && playerColor && !isGameOver;
+  const isSpectator = !playerColor;
+  const isUnlimited = gameData.timeControl.initial === 0;
 
   return (
     <div className="min-h-screen bg-background">
@@ -201,20 +365,31 @@ export default function Game() {
           </Button>
           
           <div className="flex items-center gap-2">
-            {game.result !== '*' && (
+            {/* Time control badge */}
+            <Badge variant="outline" className="text-xs">
+              <Clock className="h-3 w-3 mr-1" />
+              {formatTimeControl(gameData.timeControl)}
+            </Badge>
+            
+            {result !== '*' && (
               <Badge variant="secondary" className="text-sm">
-                {getResultText(game.result)}
+                {getResultText(result)}
               </Badge>
             )}
             {isPublishing && (
               <Badge variant="outline" className="text-sm animate-pulse">
                 <Loader2 className="h-3 w-3 mr-1 animate-spin" />
-                Signing move...
+                Signing...
               </Badge>
             )}
           </div>
 
-          <LoginArea className="max-w-40" />
+          <div className="flex items-center gap-2">
+            <Button variant="ghost" size="sm" onClick={() => refetch()}>
+              <RefreshCw className="h-4 w-4" />
+            </Button>
+            <LoginArea className="max-w-40" />
+          </div>
         </div>
       </header>
 
@@ -224,20 +399,20 @@ export default function Game() {
           <div className="space-y-4">
             {/* Opponent (top) */}
             <PlayerInfo
-              pubkey={game.orientation === 'w' ? gameData.black : gameData.white}
-              isWhite={game.orientation !== 'w'}
-              isCurrentTurn={game.turn !== game.orientation}
+              pubkey={orientation === 'w' ? gameData.black : gameData.white}
+              isWhite={orientation !== 'w'}
+              isCurrentTurn={turn !== orientation && !isGameOver}
               isCurrentUser={false}
             />
 
             {/* Chess Board */}
             <div className="relative">
               <ChessBoard
-                chess={game.chess}
-                orientation={game.orientation}
+                chess={chess}
+                orientation={orientation}
                 onMove={canPlay ? handleMove : undefined}
-                disabled={!canPlay || !game.isMyTurn || isPublishing}
-                lastMove={game.lastMove}
+                disabled={!canPlay || !isMyTurn || isPublishing}
+                lastMove={lastMove}
               />
               
               {/* Spectator overlay */}
@@ -250,11 +425,14 @@ export default function Game() {
               )}
 
               {/* Game over overlay */}
-              {game.isGameOver && (
+              {isGameOver && (
                 <div className="absolute inset-0 bg-background/80 backdrop-blur-sm flex items-center justify-center rounded-lg">
                   <Card className="max-w-xs">
                     <CardContent className="pt-6 text-center space-y-4">
-                      <h3 className="text-xl font-bold">{getResultText(game.result)}</h3>
+                      <h3 className="text-xl font-bold">{getResultText(result)}</h3>
+                      <p className="text-sm text-muted-foreground">
+                        {moveHistory.length} moves played
+                      </p>
                       <Button onClick={() => navigate('/')}>
                         <ArrowLeft className="h-4 w-4 mr-2" />
                         Back to Home
@@ -267,50 +445,74 @@ export default function Game() {
 
             {/* Current player (bottom) */}
             <PlayerInfo
-              pubkey={game.orientation === 'w' ? gameData.white : gameData.black}
-              isWhite={game.orientation === 'w'}
-              isCurrentTurn={game.turn === game.orientation}
-              isCurrentUser={!!game.playerColor}
+              pubkey={orientation === 'w' ? gameData.white : gameData.black}
+              isWhite={orientation === 'w'}
+              isCurrentTurn={turn === orientation && !isGameOver}
+              isCurrentUser={!!playerColor}
             />
           </div>
 
           {/* Sidebar */}
           <div className="space-y-4">
-            {/* Clock */}
-            <Card>
-              <CardHeader className="pb-3">
-                <CardTitle className="text-base">Clock</CardTitle>
-              </CardHeader>
-              <CardContent>
-                <ChessClock
-                  timeControl={gameData.timeControl}
-                  turn={game.turn}
-                  gameStarted={game.gameStarted}
-                  gameOver={game.isGameOver}
-                  onTimeout={game.handleTimeout}
-                  onTimeUpdate={game.handleTimeUpdate}
-                />
-              </CardContent>
-            </Card>
+            {/* Clock - only show for timed games */}
+            {!isUnlimited && (
+              <Card>
+                <CardHeader className="pb-3">
+                  <CardTitle className="text-base">Clock</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <ChessClock
+                    timeControl={gameData.timeControl}
+                    turn={turn}
+                    gameStarted={moveHistory.length > 0}
+                    gameOver={isGameOver}
+                    onTimeout={handleTimeout}
+                  />
+                </CardContent>
+              </Card>
+            )}
+
+            {/* Game Info for unlimited games */}
+            {isUnlimited && (
+              <Card>
+                <CardHeader className="pb-3">
+                  <CardTitle className="text-base">Game Info</CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-2">
+                  <div className="flex justify-between text-sm">
+                    <span className="text-muted-foreground">Time Control</span>
+                    <span>Unlimited</span>
+                  </div>
+                  <div className="flex justify-between text-sm">
+                    <span className="text-muted-foreground">Moves</span>
+                    <span>{moveHistory.length}</span>
+                  </div>
+                  <div className="flex justify-between text-sm">
+                    <span className="text-muted-foreground">Status</span>
+                    <span>{isGameOver ? getResultText(result) : (isMyTurn ? 'Your turn' : "Opponent's turn")}</span>
+                  </div>
+                </CardContent>
+              </Card>
+            )}
 
             {/* Move History */}
             <Card>
               <CardHeader className="pb-3">
-                <CardTitle className="text-base">Moves</CardTitle>
+                <CardTitle className="text-base">Move History</CardTitle>
               </CardHeader>
               <CardContent>
                 <ScrollArea className="h-48">
-                  {game.moveHistory.length === 0 ? (
+                  {moveHistory.length === 0 ? (
                     <p className="text-sm text-muted-foreground text-center py-4">
-                      No moves yet
+                      No moves yet - White to play
                     </p>
                   ) : (
                     <div className="space-y-1 font-mono text-sm">
-                      {Array.from({ length: Math.ceil(game.moveHistory.length / 2) }, (_, i) => (
+                      {Array.from({ length: Math.ceil(moveHistory.length / 2) }, (_, i) => (
                         <div key={i} className="flex gap-2">
                           <span className="w-6 text-muted-foreground">{i + 1}.</span>
-                          <span className="w-16">{game.moveHistory[i * 2]?.san}</span>
-                          <span className="w-16">{game.moveHistory[i * 2 + 1]?.san || ''}</span>
+                          <span className="w-16">{moveHistory[i * 2]?.san}</span>
+                          <span className="w-16">{moveHistory[i * 2 + 1]?.san || ''}</span>
                         </div>
                       ))}
                     </div>
@@ -327,7 +529,6 @@ export default function Game() {
                     variant="outline"
                     className="w-full justify-start"
                     onClick={handleResign}
-                    disabled={game.isGameOver}
                   >
                     <Flag className="h-4 w-4 mr-2 text-red-500" />
                     Resign

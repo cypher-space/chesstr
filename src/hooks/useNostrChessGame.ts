@@ -115,22 +115,19 @@ export function useChessGameData(gameId: string | undefined, white?: string, bla
     queryFn: async () => {
       if (!gameId) return null;
 
-      // Query for game events
+      // Query for game events and challenge events
       const filters: NostrFilter[] = [
         {
           kinds: [CHESS_GAME_KIND],
           '#d': [gameId],
+          limit: 20,
+        },
+        {
+          kinds: [CHESS_CHALLENGE_KIND],
+          '#d': [gameId],
           limit: 10,
         },
       ];
-
-      // Also check for accepted challenge that started this game
-      filters.push({
-        kinds: [CHESS_CHALLENGE_KIND],
-        '#d': [gameId],
-        '#status': ['accepted'],
-        limit: 5,
-      });
 
       const events = await nostr.query(filters);
 
